@@ -1,0 +1,1909 @@
+---
+title: "model_comparisons"
+author: "anon"
+date: "2025-07-21"
+output: html_document
+---
+
+
+# Main Text Analyses
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+packages <- c("dplyr","tidyr","tidyverse", "stringr", "ggplot2", "boot", "ggprism", "ggpubr", "relaimpo", "gridExtra", "effsize")
+select <- dplyr::select
+
+for (package in packages) {
+  if (!requireNamespace(package, quietly = TRUE)) {
+    install.packages(package)
+  }
+  library(package, character.only = TRUE)
+}
+```
+
+```{r}
+# see Data_Processing.ipynb for export details (from https://osf.io/wgz9t/)
+human_data <- read.csv("exports/aggregate_human_responses.csv")
+
+# Rename to match the variable name used later in this script
+MIDI_centsOff <- human_data %>%
+  select(item, MIDI_cents) %>%
+  rename(stem = item)
+
+# see Data_Processing.ipynb for export details (from https://osf.io/wgz9t/)
+all_responses <- read.csv("exports/individual_responses.csv")
+```
+
+```{r}
+# Preprocessing (replicated from https://osf.io/47hdb)
+
+hc_data <- read.csv("data/HC_data.csv")
+hc_data$constraint <- "high"
+hc_data$item_num <- substr(hc_data$code,3,4)
+lc_data <- read.csv("data/LC_data.csv")
+lc_data$constraint <- "low"
+lc_data$item_num <- substr(lc_data$code,3,4)
+colnames(lc_data) <- colnames(hc_data)
+all_data <- rbind(hc_data,lc_data)
+
+code_levels <- levels(all_data$code)
+```
+
+```{r}
+# From Morgan et al. (2019) (https://osf.io/wgz9t/), predictions from Temperley-HP with key
+
+# Temperley Hansen-Pearce corpus parameters (with key)
+temperley.key.hp <- read.csv("data/hp_logProbabilities_with_keys.csv",header=F)
+temperley.key.hp$cond <- substr(temperley.key.hp$V1,1,2)
+temperley.key.hp$itemnum<- as.numeric(substr(temperley.key.hp$V1,3,4))
+temperley.key.hp$midinum<- as.numeric(substr(temperley.key.hp$V1,6,7))
+temperley.key.hp$melody <- with(temperley.key.hp,paste(cond,itemnum,sep=''))
+temperley.key.hp$MelodyMidinum <- with(temperley.key.hp,paste(melody,midinum,sep='-'))
+
+temperley_key_hp_preds <- temperley.key.hp %>%
+  mutate(prob = exp(V2)) %>%
+  select(melody, midinum, prob) %>%
+  rename(stem = melody, MIDI = midinum, temperley_hp_key_prob = prob) %>%
+  group_by(stem) %>%
+  summarise(
+    MIDI_max = MIDI[which.max(temperley_hp_key_prob)],
+    max_prob = max(temperley_hp_key_prob, na.rm = TRUE),
+    weighted_avg = weighted.mean(MIDI, temperley_hp_key_prob, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(model = "Temperley HP with key")
+```
+
+```{r}
+# From Morgan et al. (2019) (https://osf.io/wgz9t/), predictions from IDyOM-HP
+
+pitch.data <- read.table("data/25-cpitch-cpintfref%cpint-22_23_24-nil-melody-nil-1-both-nil-t-nil-c-nil-t-t-x-3.dat",sep=" ",header=TRUE)
+
+stem.lens <- read.table("data/melody stem lengths.txt",sep=" ",header=TRUE)
+stem.lens$AC01 <- NA
+stem.lens$NC01 <- NA
+tmp <- as.numeric(stem.lens[1,as.character(pitch.data$melody.name)])
+pitch.data$target <- pitch.data$note.id==tmp+1
+pitch.data <-subset(pitch.data,target)
+  #IDyOM makes predictions for all notes in the melody, we only care about the last one
+pitch.data$melody.name <- sapply(pitch.data$melody.name,function(x){sub("AC0?","HC",x)})
+pitch.data$melody.name <- sapply(pitch.data$melody.name,function(x){sub("NC0?","LC",x)})
+
+tonics <- rep(pitch.data[match(code_levels[1:45],pitch.data$melody.name),"cpitch"],2)
+tonics_list <- as.list(tonics)
+names(tonics_list) <- code_levels
+
+idyom_hp_preds <- pitch.data %>%
+  mutate(stem = melody.name) %>%
+  select(stem, matches("^cpitch\\.[0-9]+$")) %>%
+  pivot_longer(
+    cols = matches("^cpitch\\.[0-9]+$"),
+    names_to = "MIDI",
+    names_prefix = "cpitch\\.",
+    values_to = "idyom_hp_prob"
+  ) %>%
+  mutate(MIDI = as.integer(MIDI)) %>%
+  group_by(stem) %>%
+  summarise(
+    MIDI_max = MIDI[which.max(idyom_hp_prob)],
+    max_prob = max(idyom_hp_prob, na.rm = TRUE),
+    weighted_avg = weighted.mean(MIDI, idyom_hp_prob, na.rm = TRUE)
+  ) %>%
+  ungroup() %>% 
+  mutate(model = "IDyOM HP")
+```
+
+```{r}
+# PMFM model output
+pmfm <- read.csv("exports/correlation_full.csv")
+pmfm <- pmfm %>% rename(stem = IDs, Human_MIDI = human_means, PMFM_cont_mean = model_means, PMFM_round_mean = rounded_model_means, PMFM_max = max_likelihood_notes)
+
+# convert names
+melody_names <- read.csv("data/new_melody_numbers.csv")
+
+pmfm <- pmfm %>%
+  left_join(melody_names, by = c("stem" = "original")) %>%
+  mutate(stem = if_else(!is.na(encoded), encoded, stem)) %>%
+  select(-c(name_encode, number_encode, name_original, number_original, encoded))
+
+df <- pmfm %>%
+  left_join(
+    MIDI_centsOff,
+    by = "stem"
+  ) %>%
+  left_join(
+    temperley_key_hp_preds %>%
+      select(stem, MIDI_max, weighted_avg) %>%
+      rename(
+        TemperleyHP_key_max = MIDI_max,
+        TemperleyHP_key_avg = weighted_avg
+      ),
+    by = "stem"
+  ) %>%
+  # IDyOM HP
+  left_join(
+    idyom_hp_preds %>%
+      select(stem, MIDI_max, weighted_avg) %>%
+      rename(
+        IDyOMHP_max = MIDI_max,
+        IDyOMHP_avg = weighted_avg
+      ),
+    by = "stem"
+  ) %>%
+  rename(Human_cents = MIDI_cents)
+
+df$PMFM_round_max <- round(df$PMFM_max)
+
+shape = read.csv("data/all_keys.csv") %>%
+  mutate(stemID = trimws(stemID)) %>%
+  left_join(melody_names, by = c("stemID" = "original"))
+
+df = df %>%
+  left_join(shape %>% select(encoded, shape), by = c("stem" = "encoded"))
+
+df_lc <- df %>% filter(str_starts(stem, "LC"))
+df_hc <- df %>% filter(str_starts(stem, "HC"))
+```
+
+```{r}
+# Helper function for correlation analyses
+print_corr_info <- function(x, y, label = "") {
+  res <- cor.test(x, y)
+  r <- res$estimate
+  r_squared <- r^2
+  p_val <- res$p.value
+  cat(label, "\n")
+  cat(sprintf("  r = %.3f, R^2 = %.3f, p = %.5f\n\n", r, r_squared, p_val))
+}
+
+# Full data
+cat("Full data\n")
+print_corr_info(df$Human_MIDI, df$PMFM_max, "Human vs PMFM (max)")
+print_corr_info(df$Human_cents, df$TemperleyHP_key_avg, "Human vs Temperley (avg)")
+print_corr_info(df$Human_cents, df$IDyOMHP_avg, "Human vs IDyOM (avg)")
+
+# AC data
+cat("AC data\n")
+print_corr_info(df_hc$Human_MIDI, df_hc$PMFM_max, "Human vs PMFM (max)")
+print_corr_info(df_hc$Human_MIDI, df_hc$TemperleyHP_key_max, "Human vs Temperley (max)")
+print_corr_info(df_hc$Human_MIDI, df_hc$IDyOMHP_max, "Human vs IDyOM (max)")
+
+# NC data
+cat("NC data\n")
+print_corr_info(df_lc$Human_MIDI, df_lc$PMFM_max, "Human vs PMFM (max)")
+print_corr_info(df_lc$Human_MIDI, df_lc$TemperleyHP_key_max, "Human vs Temperley (max)")
+print_corr_info(df_lc$Human_MIDI, df_lc$IDyOMHP_max, "Human vs IDyOM (max)")
+```
+
+```{r}
+# Boostrapped correlations via resampling of participant responses
+print_corr_info_boot <- function(responses, model_df, label = "", n_boot = 1000, n_samp = 25) {
+  res <- cor.test(model_df$x, model_df$Y)
+  r <- res$estimate
+  r_squared <- r^2
+  p_val <- res$p.value
+  
+  stem_list <- unique(model_df$item)
+  boot_corrs <- numeric(n_boot)
+  
+  for (i in seq_len(n_boot)) {
+    actual_means <- numeric(length(stem_list))
+    
+    for (j in seq_along(stem_list)) {
+      stem <- stem_list[j]
+      tmp <- responses %>% filter(item == stem)
+      smp <- sample(tmp$MIDI, n_samp, replace = TRUE)
+      actual_means[j] <- mean(smp)
+    }
+    
+    boot_corrs[i] <- cor(actual_means, model_df$Y)
+  }
+  
+  boot_mean <- mean(boot_corrs)
+  ci <- quantile(boot_corrs, c(0.025, 0.975))
+  
+  cat(label, "\n")
+  cat(sprintf("  r = %.3f, R^2 = %.3f, p = %.4f\n", r, r_squared, p_val))
+  cat(sprintf("  Bootstrap mean r = %.3f, 95%% CI [%.3f, %.3f]\n\n", 
+              boot_mean, ci[1], ci[2]))
+}
+
+full <- df %>%
+  dplyr::select(stem, Human_MIDI, PMFM_round_max) %>%
+  rename(item = stem, x = Human_MIDI, Y = PMFM_round_max)
+
+ac <- df_hc %>%
+  dplyr::select(stem, Human_MIDI, PMFM_round_max) %>%
+  rename(item = stem, x = Human_MIDI, Y = PMFM_round_max)
+
+nc <- df_lc %>%
+  dplyr::select(stem, Human_MIDI, PMFM_round_max) %>%
+  rename(item = stem, x = Human_MIDI, Y = PMFM_round_max)
+
+cat("Full data\n")
+print_corr_info_boot(all_responses, full, "Human vs PMFM")
+
+cat("AC data\n")
+print_corr_info_boot(all_responses, ac, "Human vs PMFM (AC)")
+
+cat("NC data\n")
+print_corr_info_boot(all_responses, nc, "Human vs PMFM (NC)")
+```
+
+## Main correlation plots
+```{r}
+df$PMFM_round_max <- round(df$PMFM_max)
+
+n_boot <- 1000
+boot_cors <- numeric(n_boot)
+
+for (i in 1:n_boot) {
+  boot_idx <- sample(1:nrow(df), nrow(df), replace = TRUE)
+  boot_cors[i] <- cor(df$PMFM_round_max[boot_idx], df$Human_MIDI[boot_idx])
+}
+
+boot_mean <- mean(boot_cors)
+boot_ci <- quantile(boot_cors, c(0.025, 0.975))
+
+test_result <- cor.test(df$PMFM_round_max, df$Human_MIDI)
+r_val <- round(test_result$estimate, 2)
+p_val <- signif(test_result$p.value, 1)
+r_squared <- round(r_val^2, 2)
+
+print(paste("Correlation r =", r_val, ", p =", p_val, ", R² =", r_squared))
+print(paste("Bootstrap mean r =", round(boot_mean, 3)))
+print(paste("Bootstrap 95% CI = [", round(boot_ci[1], 3), ",", round(boot_ci[2], 3), "]"))
+
+# Scatterplot of PMFM model vs human responses
+
+full_data <- ggplot(df, aes(x = PMFM_round_max, y = Human_MIDI)) +
+                geom_abline(intercept = 0, slope = 1, color = "darkred", linetype = "dashed", linewidth = 1) +
+                geom_point(alpha = 1) +
+                geom_smooth(method = "lm", se = TRUE,
+                            color = "blue", fill = "grey") +
+                scale_x_continuous(breaks = seq(55, 70, by = 3)) +
+                scale_y_continuous(breaks = seq(55, 70, by = 3)) +
+                theme_classic() +
+                theme(
+                  axis.title.x = element_text(size = 20),
+                  axis.title.y = element_text(size = 20),
+                  axis.text.x = element_text(size = 16),
+                  axis.text.y = element_text(size = 16)
+                ) +
+                labs(x = "Model output", y = "Human output")
+
+print(c(r_val, p_val, r_squared))
+# save to png
+ggsave("plots/full_data.png", plot = full_data, width = 10, height = 6)
+```
+
+```{r}
+df_hc$PMFM_round_max <- round(df_hc$PMFM_max)
+
+n_boot <- 1000
+boot_cors <- numeric(n_boot)
+
+for (i in 1:n_boot) {
+  boot_idx <- sample(1:nrow(df_hc), nrow(df_hc), replace = TRUE)
+  boot_cors[i] <- cor(df_hc$PMFM_round_max[boot_idx], df_hc$Human_MIDI[boot_idx])
+}
+
+boot_mean <- mean(boot_cors)
+boot_ci <- quantile(boot_cors, c(0.025, 0.975))
+
+test_result <- cor.test(df_hc$PMFM_round_max, df_hc$Human_MIDI)
+r_val <- round(test_result$estimate, 2)
+p_val <- signif(test_result$p.value, 1)
+r_squared <- round(r_val^2, 2)
+
+print(paste("Correlation r =", r_val, ", p =", p_val, ", R² =", r_squared))
+print(paste("Bootstrap mean r =", round(boot_mean, 3)))
+print(paste("Bootstrap 95% CI = [", round(boot_ci[1], 3), ",", round(boot_ci[2], 3), "]"))
+
+# Scatterplot of PMFM model vs human responses (AC)
+
+AC_data <- ggplot(df_hc, aes(x = PMFM_round_max, y = Human_MIDI)) +
+                geom_abline(intercept = 0, slope = 1, color = "darkred", linetype = "dashed", linewidth = 1) +
+                geom_point(alpha = 1) +
+                geom_smooth(method = "lm", se = TRUE,
+                            color = "blue", fill = "grey") +
+                scale_x_continuous(breaks = seq(55, 70, by = 3)) +
+                scale_y_continuous(breaks = seq(55, 70, by = 3)) +
+                theme_classic() +
+                theme(
+                  axis.title.x = element_text(size = 20),
+                  axis.title.y = element_text(size = 20),
+                  axis.text.x = element_text(size = 16),
+                  axis.text.y = element_text(size = 16)
+                ) +
+                labs(x = "Model output", y = "Human output")
+
+print(c(r_val, p_val, r_squared))
+
+# save to png
+ggsave("plots/AC_data.png", plot = AC_data, width = 10, height = 6)
+```
+
+```{r}
+df_lc$PMFM_round_max <- round(df_lc$PMFM_max)
+
+n_boot <- 1000
+boot_cors <- numeric(n_boot)
+
+for (i in 1:n_boot) {
+  boot_idx <- sample(1:nrow(df_lc), nrow(df_lc), replace = TRUE)
+  boot_cors[i] <- cor(df_lc$PMFM_round_max[boot_idx], df_lc$Human_MIDI[boot_idx])
+}
+
+boot_mean <- mean(boot_cors)
+boot_ci <- quantile(boot_cors, c(0.025, 0.975))
+
+test_result <- cor.test(df_lc$PMFM_round_max, df_lc$Human_MIDI)
+r_val <- round(test_result$estimate, 3)
+p_val <- signif(test_result$p.value, 1)
+r_squared <- round(r_val^2, 2)
+
+print(paste("Correlation r =", r_val, ", p =", p_val, ", R² =", r_squared))
+print(paste("Bootstrap mean r =", round(boot_mean, 3)))
+print(paste("Bootstrap 95% CI = [", round(boot_ci[1], 3), ",", round(boot_ci[2], 3), "]"))
+
+# Scatterplot of PMFM model vs human responses (NC)
+
+NC_data <- ggplot(df_lc, aes(x = PMFM_round_max, y = Human_MIDI)) +
+                geom_abline(intercept = 0, slope = 1, color = "darkred", linetype = "dashed", linewidth = 1) +
+                geom_point(alpha = 1) +
+                geom_smooth(method = "lm", se = TRUE,
+                            color = "blue", fill = "grey") +
+                scale_x_continuous(breaks = seq(55, 70, by = 3)) +
+                scale_y_continuous(breaks = seq(55, 70, by = 3)) +
+                theme_classic() +
+                theme(
+                  axis.title.x = element_text(size = 20),
+                  axis.title.y = element_text(size = 20),
+                  axis.text.x = element_text(size = 16),
+                  axis.text.y = element_text(size = 16)
+                ) +
+                labs(x = "Model output", y = "Human output")
+
+print(c(r_val, p_val, r_squared))
+
+# save to png
+ggsave("plots/NC_data.png", plot = NC_data, width = 10, height = 6)
+```
+
+## Relative importance analyses
+```{r}
+# Helper function to perform regression decomposition
+analyze_model_combo <- function(df, predictors, model_names, combo_name) {
+  cat("\n")
+  cat(paste(rep("=", 60), collapse = ""), "\n")
+  cat(sprintf("%-60s\n", paste0(combo_name, " MODEL")))
+  cat(paste(rep("=", 60), collapse = ""), "\n\n")
+  
+  # Build formula
+  formula_str <- paste("Human_MIDI ~", paste(predictors, collapse = " + "))
+  m_full <- lm(as.formula(formula_str), data = df)
+  s_full <- summary(m_full)
+  
+  cat(sprintf("Total R²: %.4f\n", s_full$r.squared))
+  cat(sprintf("Adjusted R²: %.4f\n", s_full$adj.r.squared))
+  cat(sprintf("F-statistic: %.4f, p-value: %.4e\n\n", 
+              s_full$fstatistic[1], 
+              pf(s_full$fstatistic[1], s_full$fstatistic[2], s_full$fstatistic[3], lower.tail = FALSE)))
+  
+  if (length(predictors) > 1) {
+    # Unique variance (ΔR²)
+    cat("---------------- UNIQUE VARIANCE (ΔR²) ----------------\n")
+    delta_R2 <- numeric(length(predictors))
+    names(delta_R2) <- model_names
+    
+    for (i in seq_along(predictors)) {
+      reduced_predictors <- predictors[-i]
+      formula_reduced <- paste("Human_MIDI ~", paste(reduced_predictors, collapse = " + "))
+      m_reduced <- lm(as.formula(formula_reduced), data = df)
+      delta_R2[i] <- s_full$r.squared - summary(m_reduced)$r.squared
+    }
+    
+    print(round(delta_R2, 4))
+    cat("\n% of Total Explained Variance:\n")
+    print(round(100 * delta_R2 / s_full$r.squared, 2))
+    
+    # Partial R²
+    cat("\n---------------- PARTIAL R² (Conditional) ----------------\n")
+    tvals <- s_full$coefficients[-1, "t value"]
+    df_res <- s_full$df[2]
+    partial_R2 <- (tvals^2) / (tvals^2 + df_res)
+    names(partial_R2) <- model_names
+    print(round(partial_R2, 4))
+    
+    # LMG / Shapley
+    cat("\n---------------- LMG / SHAPLEY IMPORTANCE ----------------\n")
+    ri <- calc.relimp(m_full, type = "lmg", rela = TRUE)
+    print(round(ri$lmg, 4))
+    cat("\nProportion of Explained Variance (sums to 1):\n")
+    print(round(ri$lmg / sum(ri$lmg), 4))
+  } else {
+    # Single predictor - just show simple regression stats
+    cat("Single predictor model - no decomposition needed\n")
+    cat(sprintf("Standardized β: %.4f\n", 
+                s_full$coefficients[2, "Estimate"] * sd(df[[predictors]]) / sd(df$Human_MIDI)))
+  }
+  
+  cat("\n")
+  return(list(model = m_full, summary = s_full))
+}
+
+# Run all combinations
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "FULL MODEL COMPARISON ANALYSIS"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+# Single-model baselines
+analyze_model_combo(df,
+                    c("PMFM_round_max"),
+                    c("PMFM"),
+                    "PMFM ONLY")
+
+analyze_model_combo(df,
+                    c("TemperleyHP_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY")
+
+analyze_model_combo(df,
+                    c("IDyOMHP_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY")
+
+# Two-model combinations
+analyze_model_combo(df,
+                    c("PMFM_round_max", "TemperleyHP_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY")
+
+analyze_model_combo(df,
+                    c("PMFM_round_max", "IDyOMHP_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM")
+
+analyze_model_combo(df,
+                    c("TemperleyHP_key_max", "IDyOMHP_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM")
+
+# Full three-model combination
+analyze_model_combo(df,
+                    c("PMFM_round_max", "TemperleyHP_key_max", "IDyOMHP_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS)")
+```
+
+### AC Stems
+```{r}
+# Run all combinations
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "AC STEMS MODEL COMPARISON ANALYSIS"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+# Single-model baselines
+analyze_model_combo(df_hc,
+                    c("TemperleyHP_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY")
+
+analyze_model_combo(df_hc,
+                    c("IDyOMHP_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY")
+
+# Two-model combinations
+analyze_model_combo(df_hc,
+                    c("PMFM_round_max", "TemperleyHP_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY")
+
+analyze_model_combo(df_hc,
+                    c("PMFM_round_max", "IDyOMHP_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM")
+
+analyze_model_combo(df_hc,
+                    c("TemperleyHP_key_max", "IDyOMHP_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM")
+
+# Full three-model combination
+analyze_model_combo(df_hc,
+                    c("PMFM_round_max", "TemperleyHP_key_max", "IDyOMHP_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS)")
+```
+
+### NC Stems
+```{r}
+# Run all combinations
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "NC STEMS MODEL COMPARISON ANALYSIS"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+# Single-model baselines
+analyze_model_combo(df_lc,
+                    c("TemperleyHP_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY")
+
+analyze_model_combo(df_lc,
+                    c("IDyOMHP_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY")
+
+# Two-model combinations
+analyze_model_combo(df_lc,
+                    c("PMFM_round_max", "TemperleyHP_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY")
+
+analyze_model_combo(df_lc,
+                    c("PMFM_round_max", "IDyOMHP_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM")
+
+analyze_model_combo(df_lc,
+                    c("TemperleyHP_key_max", "IDyOMHP_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM")
+
+# Full three-model combination
+analyze_model_combo(df_lc,
+                    c("PMFM_round_max", "TemperleyHP_key_max", "IDyOMHP_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS)")
+```
+
+### Contour classification (Huron, 1996)
+```{r}
+# Objective contour classification following Huron (1996): for each melody,
+# the first pitch, last pitch, and the mean of the remaining mid-phrase
+# pitches are compared. Ascending: last > mid > first. Descending: the
+# reverse. Concave ("u"): first and last pitches both higher than the
+# mid-phrase mean. Convex ("arch"): first and last pitches both lower than
+# the mid-phrase mean.
+melodies_wide <- read.csv("data/all_melodies_final_means.csv")
+
+classify_huron <- function(notes) {
+  n <- length(notes)
+  first_pitch <- notes[1]
+  last_pitch  <- notes[n]
+  mid_pitch   <- mean(notes[2:(n - 1)])
+
+  if (last_pitch > mid_pitch && mid_pitch > first_pitch) {
+    "ascending"
+  } else if (last_pitch < mid_pitch && mid_pitch < first_pitch) {
+    "descending"
+  } else if (first_pitch > mid_pitch && last_pitch > mid_pitch) {
+    "concave"
+  } else if (first_pitch < mid_pitch && last_pitch < mid_pitch) {
+    "convex"
+  } else {
+    "other"
+  }
+}
+
+huron_contours <- lapply(names(melodies_wide), function(col_name) {
+  vals <- melodies_wide[[col_name]]
+  vals <- vals[!is.na(vals)]
+  notes <- vals[-length(vals)] # drop the trailing human-mean rating
+  data.frame(
+    stemID = trimws(col_name),
+    huron_contour = classify_huron(notes),
+    stringsAsFactors = FALSE
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(huron_shape = case_when(
+    huron_contour %in% c("ascending", "descending") ~ "linear",
+    huron_contour == "convex" ~ "arch",
+    huron_contour == "concave" ~ "u",
+    TRUE ~ "other"
+  ))
+
+# Attach the Huron contour categories to the main analysis data frame
+# (stemID above is the AC/NC-style name; melody_names maps that to the
+# HC/LC-style "stem" identifier used in df)
+df <- df %>%
+  left_join(
+    huron_contours %>%
+      left_join(melody_names, by = c("stemID" = "original")) %>%
+      select(encoded, huron_contour),
+    by = c("stem" = "encoded")
+  )
+```
+
+### Cadence
+```{r}
+# Paired bootstrap: all models use the same resampled responses per iteration
+bootstrap_r2_paired <- function(responses, df_sub, predictor_sets, n_boot = 1000, n_samp = 25) {
+  stem_list <- unique(df_sub$stem)
+  model_names <- names(predictor_sets)
+  boot_r2s <- matrix(NA, nrow = n_boot, ncol = length(model_names),
+                     dimnames = list(NULL, model_names))
+  
+  for (i in seq_len(n_boot)) {
+    # Resample ONCE, shared across all models
+    human_means <- sapply(stem_list, function(stem) {
+      tmp <- responses %>% filter(item == stem)
+      mean(sample(tmp$MIDI, n_samp, replace = TRUE))
+    })
+    boot_df <- df_sub %>%
+      mutate(human_mean = human_means[match(stem, stem_list)])
+    
+    for (model_name in model_names) {
+      formula_str <- paste("human_mean ~", paste(predictor_sets[[model_name]], collapse = " + "))
+      fit <- lm(as.formula(formula_str), data = boot_df)
+      boot_r2s[i, model_name] <- summary(fit)$r.squared
+    }
+  }
+  boot_r2s
+}
+
+subsets <- list(
+  Full   = df,
+  AC     = df_hc,
+  NC     = df_lc
+)
+predictor_sets <- list(
+  PMFM      = "PMFM_round_max",
+  Temperley = "TemperleyHP_key_max",
+  IDyOM     = "IDyOMHP_max"
+)
+
+# Run paired bootstrap for each subset
+boot_matrices <- lapply(names(subsets), function(subset_name) {
+  cat(sprintf("Running: %s\n", subset_name))
+  mat <- bootstrap_r2_paired(all_responses, subsets[[subset_name]], predictor_sets,
+                              n_boot = 1000, n_samp = 25)
+  list(subset = subset_name, mat = mat)
+})
+names(boot_matrices) <- names(subsets)
+
+# Rebuild results_r2 from paired matrices
+results_r2 <- lapply(names(subsets), function(subset_name) {
+  mat <- boot_matrices[[subset_name]]$mat
+  lapply(names(predictor_sets), function(model_name) {
+    vals <- mat[, model_name]
+    data.frame(
+      subset = subset_name,
+      model  = model_name,
+      mean   = mean(vals),
+      lo     = quantile(vals, 0.025),
+      hi     = quantile(vals, 0.975)
+    )
+  }) %>% bind_rows()
+}) %>% bind_rows()
+results_r2$subset <- factor(results_r2$subset, levels = names(subsets))
+results_r2$model  <- factor(results_r2$model,  levels = names(predictor_sets))
+
+# Paired p-value: based on per-iteration differences
+boot_pval_paired <- function(dist_a, dist_b) {
+  diffs <- dist_a - dist_b
+  2 * min(mean(diffs > 0), mean(diffs < 0))
+}
+
+stars <- function(p) {
+  if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else NA
+}
+
+get_dist <- function(subset_name, model_name) {
+  boot_matrices[[subset_name]]$mat[, model_name]
+}
+
+model_offset <- c(PMFM = -0.267, Temperley = 0, IDyOM = 0.267)
+model_pairs  <- list(c("PMFM","Temperley"), c("PMFM","IDyOM"), c("Temperley","IDyOM"))
+y_steps      <- c(0.04, 0.08, 0.12)
+
+make_annot <- function(subset_names, x_lookup) {
+  rows <- list()
+  for (sn in subset_names) {
+    x_center <- x_lookup[[sn]]
+    max_mean <- max(results_r2$hi[results_r2$subset == sn])
+    for (k in seq_along(model_pairs)) {
+      m1 <- model_pairs[[k]][1]; m2 <- model_pairs[[k]][2]
+      p  <- boot_pval_paired(get_dist(sn, m1), get_dist(sn, m2))
+      s  <- stars(p)
+      if (!is.na(s)) {
+        rows[[length(rows)+1]] <- data.frame(
+          x     = x_center + model_offset[[m1]],
+          xend  = x_center + model_offset[[m2]],
+          y     = max_mean + y_steps[k],
+          label = s
+        )
+      }
+    }
+  }
+  bind_rows(rows)
+}
+
+cadence_x <- list(AC = 1, NC = 2)
+
+cadence_annot <- make_annot(c("AC", "NC"), cadence_x)
+
+add_brackets <- function(p, annot) {
+  if (nrow(annot) == 0) return(p)
+  p +
+    geom_segment(data = annot, inherit.aes = FALSE,
+                 aes(x = x, xend = xend, y = y, yend = y), linewidth = 0.4) +
+    geom_segment(data = annot, inherit.aes = FALSE,
+                 aes(x = x, xend = x, y = y - 0.005, yend = y), linewidth = 0.4) +
+    geom_segment(data = annot, inherit.aes = FALSE,
+                 aes(x = xend, xend = xend, y = y - 0.005, yend = y), linewidth = 0.4) +
+    geom_text(data = annot, inherit.aes = FALSE,
+              aes(x = (x + xend) / 2, y = y + 0.008, label = label),
+              size = 3.5, family = "Arial")
+}
+
+cadence_plot <- add_brackets(
+  ggplot(results_r2 %>% filter(subset %in% c("AC", "NC")),
+         aes(x = subset, y = mean, fill = model)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+    geom_errorbar(aes(ymin = lo, ymax = hi),
+                  position = position_dodge(width = 0.8), width = 0.0) +
+    scale_fill_manual(values = c("PMFM" = "#1f77b4", "Temperley" = "#ff7f0e", "IDyOM" = "#2ca02c")) +
+    labs(x = "Subset", y = expression(R^2), fill = "Model",
+         title = "Bootstrapped R² by Cadence Type") +
+    theme_bw(base_size = 12) +
+    theme(text = element_text(family = "Arial"),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "top"),
+  cadence_annot
+)
+
+ggsave("exports/r2_bootstrap_cadence.png", cadence_plot, width = 6, height = 6, dpi = 300)
+```
+
+### Shape (Huron contour categories)
+```{r}
+# Model-comparison analysis using Huron's (1996) native four-way contour
+# classification (ascending, descending, convex, concave), computed earlier
+# alongside the manuscript's shape variable.
+df_ascending  = df %>% filter(huron_contour == "ascending")
+df_descending = df %>% filter(huron_contour == "descending")
+df_convex     = df %>% filter(huron_contour == "concave")
+df_concave    = df %>% filter(huron_contour == "convex")
+
+run_shape_combo <- function(df_sub, label) {
+  cat("\n\n")
+  cat(paste(rep("#", 70), collapse = ""), "\n")
+  cat("###", sprintf("%-60s", paste(label, "MODEL COMPARISON ANALYSIS")), "###\n")
+  cat(paste(rep("#", 70), collapse = ""), "\n")
+
+  # Single-model baselines
+  analyze_model_combo(df_sub, c("TemperleyHP_key_max"), c("Temperley"), "TEMPERLEY ONLY")
+  analyze_model_combo(df_sub, c("IDyOMHP_max"), c("IDyOM"), "IDYOM ONLY")
+
+  # Two-model combinations
+  analyze_model_combo(df_sub, c("PMFM_round_max", "TemperleyHP_key_max"), c("PMFM", "Temperley"), "PMFM + TEMPERLEY")
+  analyze_model_combo(df_sub, c("PMFM_round_max", "IDyOMHP_max"), c("PMFM", "IDyOM"), "PMFM + IDYOM")
+  analyze_model_combo(df_sub, c("TemperleyHP_key_max", "IDyOMHP_max"), c("Temperley", "IDyOM"), "TEMPERLEY + IDYOM")
+
+  # Full three-model combination
+  analyze_model_combo(df_sub, c("PMFM_round_max", "TemperleyHP_key_max", "IDyOMHP_max"), c("PMFM", "Temperley", "IDyOM"), "FULL (ALL THREE MODELS)")
+}
+
+run_shape_combo(df_ascending,  "ASCENDING")
+run_shape_combo(df_descending, "DESCENDING")
+run_shape_combo(df_convex,     "CONVEX")
+run_shape_combo(df_concave,    "CONCAVE")
+```
+
+```{r}
+# Bootstrapped R² comparison across Huron's four contour categories,
+# reusing the paired-bootstrap machinery defined in the Cadence section above.
+subsets_huron <- list(
+  Ascending  = df_ascending,
+  Descending = df_descending,
+  Convex     = df_convex,
+  Concave    = df_concave
+)
+
+boot_matrices_huron <- lapply(names(subsets_huron), function(subset_name) {
+  cat(sprintf("Running: %s\n", subset_name))
+  mat <- bootstrap_r2_paired(all_responses, subsets_huron[[subset_name]], predictor_sets,
+                              n_boot = 1000, n_samp = 25)
+  list(subset = subset_name, mat = mat)
+})
+names(boot_matrices_huron) <- names(subsets_huron)
+
+results_r2_huron <- lapply(names(subsets_huron), function(subset_name) {
+  mat <- boot_matrices_huron[[subset_name]]$mat
+  lapply(names(predictor_sets), function(model_name) {
+    vals <- mat[, model_name]
+    data.frame(
+      subset = subset_name,
+      model  = model_name,
+      mean   = mean(vals),
+      lo     = quantile(vals, 0.025),
+      hi     = quantile(vals, 0.975)
+    )
+  }) %>% bind_rows()
+}) %>% bind_rows()
+results_r2_huron$subset <- factor(results_r2_huron$subset, levels = names(subsets_huron))
+results_r2_huron$model  <- factor(results_r2_huron$model,  levels = names(predictor_sets))
+
+get_dist_huron <- function(subset_name, model_name) {
+  boot_matrices_huron[[subset_name]]$mat[, model_name]
+}
+
+make_annot_huron <- function(subset_names, x_lookup) {
+  rows <- list()
+  for (sn in subset_names) {
+    x_center <- x_lookup[[sn]]
+    max_mean <- max(results_r2_huron$hi[results_r2_huron$subset == sn])
+    for (k in seq_along(model_pairs)) {
+      m1 <- model_pairs[[k]][1]; m2 <- model_pairs[[k]][2]
+      p  <- boot_pval_paired(get_dist_huron(sn, m1), get_dist_huron(sn, m2))
+      s  <- stars(p)
+      if (!is.na(s)) {
+        rows[[length(rows)+1]] <- data.frame(
+          x     = x_center + model_offset[[m1]],
+          xend  = x_center + model_offset[[m2]],
+          y     = max_mean + y_steps[k],
+          label = s
+        )
+      }
+    }
+  }
+  bind_rows(rows)
+}
+
+huron_x     <- list(Ascending = 1, Descending = 2, Convex = 3, Concave = 4)
+huron_annot <- make_annot_huron(names(subsets_huron), huron_x)
+
+shape_plot_huron <- add_brackets(
+  ggplot(results_r2_huron,
+         aes(x = subset, y = mean, fill = model)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+    geom_errorbar(aes(ymin = lo, ymax = hi),
+                  position = position_dodge(width = 0.8), width = 0.0) +
+    scale_fill_manual(values = c("PMFM" = "#1f77b4", "Temperley" = "#ff7f0e", "IDyOM" = "#2ca02c")) +
+    labs(x = "Contour", y = expression(R^2), fill = "Model",
+         title = "Bootstrapped R² by Contour") +
+    theme_bw(base_size = 12) +
+    theme(text = element_text(family = "Arial"),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "top"),
+  huron_annot
+)
+
+for (sn in names(subsets_huron)) {
+  cat("\n", sn, "\n")
+  for (pair in model_pairs) {
+    m1 <- pair[1]; m2 <- pair[2]
+    d1 <- get_dist_huron(sn, m1)
+    d2 <- get_dist_huron(sn, m2)
+    diffs <- d1 - d2
+    n_boot <- length(diffs)
+    n_higher <- sum(diffs > 0)
+    n_lower  <- sum(diffs < 0)
+    n_tied   <- sum(diffs == 0)
+    p <- boot_pval_paired(d1, d2)
+    sig <- stars(p)
+
+    mean1 <- mean(d1); ci1 <- quantile(d1, c(0.025, 0.975))
+    mean2 <- mean(d2); ci2 <- quantile(d2, c(0.025, 0.975))
+
+    cat(sprintf(
+      "  %s R2 = %.4f, 95%% CI [%.4f, %.4f]\n",
+      m1, mean1, ci1[1], ci1[2]
+    ))
+    cat(sprintf(
+      "  %s R2 = %.4f, 95%% CI [%.4f, %.4f]\n",
+      m2, mean2, ci2[1], ci2[2]
+    ))
+    cat(sprintf(
+      "  %s vs %s: %s higher in %d/%d (%.1f%%), %s higher in %d/%d (%.1f%%), tied %d, mean diff = %.4f, p = %.4f%s\n",
+      m1, m2, m1, n_higher, n_boot, 100 * n_higher / n_boot,
+      m2, n_lower, n_boot, 100 * n_lower / n_boot,
+      n_tied, mean(diffs), p,
+      ifelse(is.na(sig), "", paste0(" ", sig))
+    ))
+  }
+}
+
+ggsave("exports/r2_bootstrap_shapes_huron.png", shape_plot_huron, width = 8, height = 6, dpi = 300)
+```
+
+
+# Supplemental Analyses
+
+```{r}
+ablation_df <- read.csv("exports/ablation_lls.csv")
+
+se <- function(x) sd(x) / sqrt(length(x))
+
+for (model_name in unique(ablation_df$model)) {
+  sub <- ablation_df[ablation_df$model == model_name, ]
+  cat("\n===", model_name, "===\n")
+  for (col in c("mean_stem_ll", "mean_pred_ll", "mean_total_ll", "cor_mean", "cor_rounded_mean", "cor_max", "cor_rounded_max")) {
+    vals <- sub[[col]]
+    cat(sprintf("  %s: %.4f ± %.4f\n", col, mean(vals), se(vals)))
+  }
+}
+```
+
+```{r}
+df$constraint <- ifelse(grepl("^HC", df$stem), "HC", "LC")
+df$stem_number <- as.numeric(gsub("^(HC|LC)", "", df$stem))
+
+df_wide <- df %>%
+  select(stem_number, constraint, sds, Human_MIDI, PMFM_round_max) %>%
+  pivot_wider(
+    names_from = constraint,
+    values_from = c(sds, Human_MIDI, PMFM_round_max),
+    names_sep = "_"
+  )
+
+df_wide <- df_wide %>%
+  mutate(
+    LC_wider = sds_LC > sds_HC,
+    sd_diff = sds_LC - sds_HC,
+    sd_ratio = sds_LC / sds_HC
+  )
+
+# Count how many pairs have LC wider
+cat("========== PAIRWISE COMPARISON ==========\n")
+cat("Number of pairs where LC has larger SD:", sum(df_wide$LC_wider, na.rm = TRUE), "/", nrow(df_wide), "\n")
+cat("Percentage:", round(100 * mean(df_wide$LC_wider, na.rm = TRUE), 1), "%\n\n")
+
+# Summary statistics
+cat("Mean SD difference (LC - HC):", round(mean(df_wide$sd_diff, na.rm = TRUE), 3), "\n")
+cat("Median SD difference (LC - HC):", round(median(df_wide$sd_diff, na.rm = TRUE), 3), "\n\n")
+
+# Paired t-test (since we have matched pairs)
+paired_t <- t.test(df_wide$sds_LC, df_wide$sds_HC, paired = TRUE)
+print(paired_t)
+
+# Wilcoxon signed-rank test (non-parametric alternative)
+paired_wilcox <- wilcox.test(df_wide$sds_LC, df_wide$sds_HC, paired = TRUE)
+print(paired_wilcox)
+
+# Sign test (simple binomial test)
+sign_test <- binom.test(sum(df_wide$LC_wider, na.rm = TRUE), 
+                        nrow(df_wide), 
+                        p = 0.5)
+print(sign_test)
+
+# Visualization - scatter plot
+ggplot(df_wide, aes(x = sds_HC, y = sds_LC)) +
+  geom_point(alpha = 0.6, size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Pairwise Comparison of Model Uncertainty",
+       subtitle = paste0(sum(df_wide$LC_wider, na.rm = TRUE), " of ", nrow(df_wide), 
+                        " pairs have LC > HC"),
+       x = "SD for HC stems",
+       y = "SD for LC stems") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# Visualization - difference plot
+ggplot(df_wide, aes(x = stem_number, y = sd_diff)) +
+  geom_col(aes(fill = LC_wider)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = c("FALSE" = "#ff7f0e", "TRUE" = "#1f77b4"),
+                    labels = c("AC wider", "NC wider")) +
+  labs(title = "SD Difference by Stem Pair (NC - AC)",
+       x = "Stem Number",
+       y = "SD Difference",
+       fill = "") +
+  theme_classic()
+
+ggsave("plots/sd_difference.png", width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+fromJSON <- function(x) {
+  x <- trimws(x)
+  x <- gsub("^\\[|\\]$", "", x)
+  as.numeric(strsplit(x, ",")[[1]])
+}
+```
+
+```{r}
+df$particles_list <- lapply(df$all_particles, fromJSON)
+
+# Create histogram for each stem
+plot_list <- lapply(1:nrow(df), function(i) {
+  data.frame(prediction = df$particles_list[[i]]) %>%
+    ggplot(aes(x = prediction)) +
+    geom_histogram(bins = 20, fill = "steelblue", alpha = 0.7) +
+    geom_vline(xintercept = df$Human_MIDI[i], color = "red", linetype = "dashed", size = 1) +
+    labs(title = df$stem[i], x = "Predicted Note", y = "Count") +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 8))
+})
+
+n_total <- length(plot_list)  # 90
+n_per_plot <- 12
+n_plots <- ceiling(n_total / n_per_plot)  # 8
+
+for (i in 1:n_plots) {
+  start_idx <- (i - 1) * n_per_plot + 1
+  end_idx <- min(i * n_per_plot, n_total)
+  chunk <- plot_list[start_idx:end_idx]
+  
+  ncols <- 4
+  nrows <- ceiling(length(chunk) / ncols)
+  
+  grid_plot <- do.call(arrangeGrob, c(chunk, ncol = ncols, nrow = nrows))
+  
+  ggsave(paste0("plots/particle_histograms_", i, ".png"),
+         grid_plot,
+         width = ncols * 4,
+         height = nrows * 4,
+         dpi = 300)
+}
+```
+
+```{r}
+ calculate_entropy <- function(particles, n_bins = 20) {
+  breaks <- seq(floor(min(particles)), ceiling(max(particles)), 
+                length.out = n_bins + 1)
+  hist_counts <- hist(particles, breaks = breaks, plot = FALSE)$counts
+  probs <- hist_counts / sum(hist_counts)
+  probs <- probs[probs > 0]
+  -sum(probs * log2(probs))
+}
+
+# Calculate entropy for each stem
+df$entropy <- sapply(df$particles_list, calculate_entropy)
+
+# Add constraint and stem number
+df$constraint <- ifelse(grepl("^HC", df$stem), "HC", "LC")
+df$stem_number <- as.numeric(gsub("^(HC|LC)", "", df$stem))
+
+cat("AGGREGATE ANALYSIS ##################################################################\n")
+
+# ========== AGGREGATE COMPARISON ==========
+cat("========== AGGREGATE COMPARISON (all HC vs all LC) ==========\n\n")
+
+cat("HC stems:\n")
+cat("  N:", sum(df$constraint == "HC"), "\n")
+cat("  Mean entropy:", round(mean(df$entropy[df$constraint == "HC"]), 3), "\n")
+cat("  SD entropy:", round(sd(df$entropy[df$constraint == "HC"]), 3), "\n")
+cat("  Median entropy:", round(median(df$entropy[df$constraint == "HC"]), 3), "\n\n")
+
+cat("LC stems:\n")
+cat("  N:", sum(df$constraint == "LC"), "\n")
+cat("  Mean entropy:", round(mean(df$entropy[df$constraint == "LC"]), 3), "\n")
+cat("  SD entropy:", round(sd(df$entropy[df$constraint == "LC"]), 3), "\n")
+cat("  Median entropy:", round(median(df$entropy[df$constraint == "LC"]), 3), "\n\n")
+
+# Independent samples t-test
+aggregate_t <- t.test(entropy ~ constraint, data = df)
+cat("Independent samples t-test:\n")
+print(aggregate_t)
+cat("\n")
+
+# Wilcoxon rank-sum test (Mann-Whitney U)
+aggregate_wilcox <- wilcox.test(entropy ~ constraint, data = df)
+cat("Wilcoxon rank-sum test:\n")
+print(aggregate_wilcox)
+cat("\n")
+
+# Effect size
+aggregate_cohen_d <- cohen.d(df$entropy[df$constraint == "LC"], 
+                             df$entropy[df$constraint == "HC"])
+cat("Cohen's d:\n")
+print(aggregate_cohen_d)
+cat("\n")
+
+# Aggregate visualization
+p_aggregate_box <- ggplot(df, aes(x = constraint, y = entropy, fill = constraint)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 2) +
+  scale_fill_manual(values = c("HC" = "#1b9e77", "LC" = "#d95f02")) +
+  labs(title = "Model Entropy by Stem Type",
+       x = "Stem Type",
+       y = "Entropy") +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 14, face = "bold"))
+
+p_aggregate_violin <- ggplot(df, aes(x = constraint, y = entropy, fill = constraint)) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.2, alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.3, size = 1.5) +
+  scale_fill_manual(values = c("HC" = "#1b9e77", "LC" = "#d95f02")) +
+  labs(title = "Distribution of Model Entropy",
+       x = "Constraint Type",
+       y = "Entropy (bits)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 14, face = "bold"))
+
+print(p_aggregate_box)
+print(p_aggregate_violin)
+
+cat("\n")
+cat("PAIRWISE ANALYSIS ##################################################################\n")
+
+# ========== PAIRWISE COMPARISON ==========
+
+# Create wide format
+df_wide <- df %>%
+  select(stem_number, constraint, entropy, sds, Human_MIDI, PMFM_round_max) %>%
+  pivot_wider(
+    names_from = constraint,
+    values_from = c(entropy, sds, Human_MIDI, PMFM_round_max),
+    names_sep = "_"
+  )
+
+df_wide <- df_wide %>%
+  mutate(
+    LC_higher_entropy = entropy_LC > entropy_HC,
+    entropy_diff = entropy_LC - entropy_HC,
+    entropy_ratio = entropy_LC / entropy_HC
+  )
+
+cat("========== PAIRWISE COMPARISON (matched pairs) ==========\n\n")
+cat("Number of pairs where LC has higher entropy:", 
+    sum(df_wide$LC_higher_entropy, na.rm = TRUE), "/", nrow(df_wide), "\n")
+cat("Percentage:", 
+    round(100 * mean(df_wide$LC_higher_entropy, na.rm = TRUE), 1), "%\n\n")
+
+cat("Mean entropy difference (LC - HC):", 
+    round(mean(df_wide$entropy_diff, na.rm = TRUE), 3), "\n")
+cat("Median entropy difference (LC - HC):", 
+    round(median(df_wide$entropy_diff, na.rm = TRUE), 3), "\n")
+cat("SD of difference:", 
+    round(sd(df_wide$entropy_diff, na.rm = TRUE), 3), "\n\n")
+
+# Paired t-test
+paired_t_entropy <- t.test(df_wide$entropy_LC, df_wide$entropy_HC, paired = TRUE)
+cat("Paired t-test:\n")
+print(paired_t_entropy)
+cat("\n")
+
+# Wilcoxon signed-rank test
+paired_wilcox_entropy <- wilcox.test(df_wide$entropy_LC, df_wide$entropy_HC, 
+                                      paired = TRUE)
+cat("Wilcoxon signed-rank test (paired):\n")
+print(paired_wilcox_entropy)
+cat("\n")
+
+# Sign test
+sign_test_entropy <- binom.test(sum(df_wide$LC_higher_entropy, na.rm = TRUE), 
+                                 nrow(df_wide), 
+                                 p = 0.5)
+cat("Sign test (binomial):\n")
+print(sign_test_entropy)
+cat("\n")
+
+# Paired Cohen's d
+paired_cohen_d <- cohen.d(df_wide$entropy_LC, df_wide$entropy_HC, paired = TRUE)
+cat("Cohen's d (paired):\n")
+print(paired_cohen_d)
+cat("\n")
+
+# Pairwise visualizations
+p_pairwise_scatter <- ggplot(df_wide, aes(x = entropy_HC, y = entropy_LC)) +
+  geom_point(alpha = 0.6, size = 3, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red", size = 1) +
+  labs(title = "Pairwise Comparison of Model Entropy",
+       subtitle = paste0(sum(df_wide$LC_higher_entropy, na.rm = TRUE), 
+                        " of ", nrow(df_wide), 
+                        " pairs have LC > HC"),
+       x = "Entropy for HC stems (bits)",
+       y = "Entropy for LC stems (bits)") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+p_pairwise_diff <- ggplot(df_wide, aes(x = stem_number, y = entropy_diff)) +
+  geom_col(aes(fill = LC_higher_entropy)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = c("FALSE" = "#d95f02", "TRUE" = "#1b9e77"),
+                    labels = c("HC higher", "LC higher")) +
+  labs(title = "Entropy Difference by Stem Pair (LC - HC)",
+       x = "Stem Number",
+       y = "Entropy Difference (bits)",
+       fill = "") +
+  theme_classic()
+
+p_pairwise_diff_hist <- ggplot(df_wide, aes(x = entropy_diff)) +
+  geom_histogram(bins = 20, fill = "steelblue", alpha = 0.7, color = "black") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 1) +
+  geom_vline(xintercept = mean(df_wide$entropy_diff), 
+             linetype = "solid", color = "blue", size = 1) +
+  labs(title = "Distribution of Entropy Differences (LC - HC)",
+       subtitle = paste0("Mean difference = ", 
+                        round(mean(df_wide$entropy_diff), 3), " bits"),
+       x = "Entropy Difference (bits)",
+       y = "Count") +
+  theme_classic()
+
+print(p_pairwise_scatter)
+print(p_pairwise_diff)
+print(p_pairwise_diff_hist)
+
+cat("\n")
+cat("SUMMARY ##################################################################\n")
+
+cat("AGGREGATE ANALYSIS:\n")
+cat("  Mean HC:", round(mean(df$entropy[df$constraint == "HC"]), 3), "bits\n")
+cat("  Mean LC:", round(mean(df$entropy[df$constraint == "LC"]), 3), "bits\n")
+cat("  Difference:", round(mean(df$entropy[df$constraint == "LC"]) - 
+                            mean(df$entropy[df$constraint == "HC"]), 3), "bits\n")
+cat("  t-test p-value:", format.pval(aggregate_t$p.value, digits = 3), "\n")
+cat("  Cohen's d:", round(aggregate_cohen_d$estimate, 3), "\n\n")
+
+cat("PAIRWISE ANALYSIS:\n")
+cat("  LC higher in", sum(df_wide$LC_higher_entropy), "of", nrow(df_wide), 
+    "pairs (", round(100 * mean(df_wide$LC_higher_entropy), 1), "%)\n")
+cat("  Mean difference:", round(mean(df_wide$entropy_diff), 3), "bits\n")
+cat("  Paired t-test p-value:", format.pval(paired_t_entropy$p.value, digits = 3), "\n")
+cat("  Paired Cohen's d:", round(paired_cohen_d$estimate, 3), "\n")
+
+ggplot(df_wide, aes(x = stem_number, y = entropy_diff)) +
+  geom_col(aes(fill = LC_higher_entropy)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = c("FALSE" = "#ff7f0e", "TRUE" = "#1f77b4"),,
+                    labels = c("AC higher", "NC higher")) +
+  labs(title = "Entropy Difference by Stem Pair (NC - AC)",
+       x = "Stem Number",
+       y = "Entropy Difference (bits)",
+       fill = "") +
+  theme_classic()
+ggsave("plots/entropy_difference.png", width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+ggplot(df, aes(x = entropy, fill = constraint)) +
+  geom_histogram(bins = 25, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("HC" = "#2ca02c", "LC" = "#1f77b4"),
+                    labels = c("HC" = "Authentic Cadence", "LC" = "Non-Authentic Cadence")) +
+  labs(title = "Response Entropy by Cadence Type",
+       x = "Entropy",
+       y = "Count",
+       fill = "") +
+  theme_classic()
+ggsave("plots/entropy_difference.png", width = 10, height = 6, dpi = 300)
+```
+
+```{r}
+results <- read.csv("exports/coarse_grid_final.csv")
+
+param_cols <- c("σ_gravity", "σ_magnetism", "σ_inertia", "w_g", "w_m", "w_i", "α")
+
+# Generate all upper-triangle pairs
+pairs <- combn(param_cols, 2, simplify = FALSE)
+
+# Global color scale
+ll_min <- Inf
+ll_max <- -Inf
+for (pair in pairs) {
+  grouped <- results %>%
+    group_by(across(all_of(pair))) %>%
+    summarise(mean_ll = mean(mean_pred_note_ll), .groups = "drop")
+  ll_min <- min(ll_min, grouped$mean_ll)
+  ll_max <- max(ll_max, grouped$mean_ll)
+}
+
+# Build all plots
+plot_list <- lapply(pairs, function(pair) {
+  p1 <- pair[1]; p2 <- pair[2]
+  
+  grouped <- results %>%
+    group_by(across(all_of(c(p1, p2)))) %>%
+    summarise(mean_ll = mean(mean_pred_note_ll), .groups = "drop") %>%
+    mutate(
+      x_label = factor(round(.data[[p1]], 3)),
+      y_label = factor(round(.data[[p2]], 3))
+    )
+  
+  ggplot(grouped, aes(x = x_label, y = y_label, fill = mean_ll)) +
+    geom_tile() +
+    scale_fill_viridis_c(limits = c(ll_min, ll_max)) +
+    labs(x = p1, y = p2, title = paste(p1, "vs", p2)) +
+    theme_minimal(base_size = 20) +
+    theme(
+      plot.title = element_text(size = 22, hjust = 0.5),
+      axis.title = element_text(size = 20),
+      axis.text = element_text(size = 18),
+      legend.position = "none",
+      plot.margin = margin(5, 5, 5, 5)
+    )
+})
+
+# Save in chunks of 3
+for (chunk in 1:7) {
+  start_idx <- (chunk - 1) * 3 + 1
+  end_idx <- min(chunk * 3, length(plot_list))
+  chunk_plots <- plot_list[start_idx:end_idx]
+  
+  png(paste0("exports/pairwise_heatmaps_predll_", chunk, ".png"),
+      width = length(chunk_plots) * 600, height = 600, res = 100)
+  grid.arrange(grobs = chunk_plots, nrow = 1)
+  dev.off()
+}
+
+# Create a dummy plot just to extract the legend
+dummy <- ggplot(data.frame(x = 1, y = 1, fill = c(ll_min, ll_max)), 
+                aes(x = x, y = y, fill = fill)) +
+  geom_tile() +
+  scale_fill_viridis_c(
+    limits = c(ll_min, ll_max),
+    name = "Mean Pred. Note LL",
+    guide = guide_colorbar(
+      direction = "horizontal",
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 30,
+      barheight = 1.5
+    )
+  ) +
+  theme_void(base_size = 20) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 18)
+  )
+
+# Extract just the legend
+get_legend <- function(p) {
+  g <- ggplotGrob(p)
+  legend <- g$grobs[[which(sapply(g$grobs, function(x) x$name) == "guide-box")]]
+  return(legend)
+}
+
+legend_grob <- get_legend(dummy)
+
+png("exports/pairwise_heatmaps_legend.png", width = 1800, height = 200, res = 100)
+grid.draw(legend_grob)
+dev.off()
+```
+
+```{r}
+cor_min <- Inf
+cor_max_val <- -Inf
+for (pair in pairs) {
+  grouped <- results %>%
+    group_by(across(all_of(pair))) %>%
+    summarise(mean_cor = mean(cor_max), .groups = "drop")
+  cor_min <- min(cor_min, grouped$mean_cor)
+  cor_max_val <- max(cor_max_val, grouped$mean_cor)
+}
+
+# Legend
+dummy_cor <- ggplot(data.frame(x = 1, y = 1, fill = c(cor_min, cor_max_val)),
+                aes(x = x, y = y, fill = fill)) +
+  geom_tile() +
+  scale_fill_viridis_c(
+    limits = c(cor_min, cor_max_val),
+    name = "Mean Correlation",
+    guide = guide_colorbar(
+      direction = "horizontal",
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 30,
+      barheight = 1.5
+    )
+  ) +
+  theme_void(base_size = 20) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 18)
+  )
+
+legend_grob_cor <- get_legend(dummy_cor)
+png("exports/pairwise_heatmaps_cor_legend.png", width = 1800, height = 200, res = 100)
+grid.draw(legend_grob_cor)
+dev.off()
+
+# Build plots
+plot_list_cor <- lapply(pairs, function(pair) {
+  p1 <- pair[1]; p2 <- pair[2]
+  
+  grouped <- results %>%
+    group_by(across(all_of(c(p1, p2)))) %>%
+    summarise(mean_cor = mean(cor_max), .groups = "drop") %>%
+    mutate(
+      x_label = factor(round(.data[[p1]], 3)),
+      y_label = factor(round(.data[[p2]], 3))
+    )
+  
+  ggplot(grouped, aes(x = x_label, y = y_label, fill = mean_cor)) +
+    geom_tile() +
+    scale_fill_viridis_c(limits = c(cor_min, cor_max_val)) +
+    labs(x = p1, y = p2, title = paste(p1, "vs", p2)) +
+    theme_minimal(base_size = 20) +
+    theme(
+      plot.title = element_text(size = 22, hjust = 0.5),
+      axis.title = element_text(size = 20),
+      axis.text = element_text(size = 18),
+      legend.position = "none",
+      plot.margin = margin(5, 5, 5, 5)
+    )
+})
+
+# Save in chunks of 3
+for (chunk in 1:7) {
+  start_idx <- (chunk - 1) * 3 + 1
+  end_idx <- min(chunk * 3, length(plot_list_cor))
+  chunk_plots <- plot_list_cor[start_idx:end_idx]
+  
+  png(paste0("exports/pairwise_heatmaps_cor_", chunk, ".png"),
+      width = length(chunk_plots) * 600, height = 600, res = 100)
+  grid.arrange(grobs = chunk_plots, nrow = 1)
+  dev.off()
+}
+```
+
+
+# Essen Corpus Analyses (Temperley & IDyOM)
+
+```{r}
+# Temperley original (Essen) corpus parameters (with key)
+temperley.key.essen <- read.csv("data/essen_logProbabilities_with_keys.csv",header=F)
+temperley.key.essen$cond <- substr(temperley.key.essen$V1,1,2)
+temperley.key.essen$itemnum<- as.numeric(substr(temperley.key.essen$V1,3,4))
+temperley.key.essen$midinum<- as.numeric(substr(temperley.key.essen$V1,6,7))
+temperley.key.essen$melody <- with(temperley.key.essen,paste(cond,itemnum,sep=''))
+temperley.key.essen$MelodyMidinum <- with(temperley.key.essen,paste(melody,midinum,sep='-'))
+
+temperley_key_essen_preds <- temperley.key.essen %>%
+  mutate(prob = exp(V2)) %>%
+  select(melody, midinum, prob) %>%
+  rename(stem = melody, MIDI = midinum, temperley_essen_key_prob = prob) %>%
+  group_by(stem) %>%
+  summarise(
+    MIDI_max = MIDI[which.max(temperley_essen_key_prob)],
+    max_prob = max(temperley_essen_key_prob, na.rm = TRUE),
+    weighted_avg = weighted.mean(MIDI, temperley_essen_key_prob, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(model = "Temperley Essen with key")
+```
+
+```{r}
+# IDyOM trained on the Essen corpus, linked viewpoint (cpintfref%cpint)
+pitch.data.essen <- read.table("data/25-cpitch-cpintfref%cpint-1_2_3_4_5_6_7_8_9_10_11_12_13_14_15_16_17_18_19_20_21_36-nil-melody-nil-1-both-nil-t-nil-c-nil-t-t-x-3.dat",sep=" ",header=TRUE)
+
+tmp_essen <- as.numeric(stem.lens[1,as.character(pitch.data.essen$melody.name)])
+pitch.data.essen$target <- pitch.data.essen$note.id==tmp_essen+1
+pitch.data.essen <- subset(pitch.data.essen,target)
+  #IDyOM makes predictions for all notes in the melody, we only care about the last one
+pitch.data.essen$melody.name <- sapply(pitch.data.essen$melody.name,function(x){sub("AC0?","HC",x)})
+pitch.data.essen$melody.name <- sapply(pitch.data.essen$melody.name,function(x){sub("NC0?","LC",x)})
+
+idyom_essen_preds <- pitch.data.essen %>%
+  mutate(stem = melody.name) %>%
+  select(stem, matches("^cpitch\\.[0-9]+$")) %>%
+  pivot_longer(
+    cols = matches("^cpitch\\.[0-9]+$"),
+    names_to = "MIDI",
+    names_prefix = "cpitch\\.",
+    values_to = "idyom_essen_prob"
+  ) %>%
+  mutate(MIDI = as.integer(MIDI)) %>%
+  group_by(stem) %>%
+  summarise(
+    MIDI_max = MIDI[which.max(idyom_essen_prob)],
+    max_prob = max(idyom_essen_prob, na.rm = TRUE),
+    weighted_avg = weighted.mean(MIDI, idyom_essen_prob, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(model = "IDyOM Essen")
+```
+
+```{r}
+df_essen <- pmfm %>%
+  left_join(
+    MIDI_centsOff,
+    by = "stem"
+  ) %>%
+  left_join(
+    temperley_key_essen_preds %>%
+      select(stem, MIDI_max, weighted_avg) %>%
+      rename(
+        TemperleyEssen_key_max = MIDI_max,
+        TemperleyEssen_key_avg = weighted_avg
+      ),
+    by = "stem"
+  ) %>%
+  left_join(
+    idyom_essen_preds %>%
+      select(stem, MIDI_max, weighted_avg) %>%
+      rename(
+        IDyOMEssen_max = MIDI_max,
+        IDyOMEssen_avg = weighted_avg
+      ),
+    by = "stem"
+  ) %>%
+  rename(Human_cents = MIDI_cents)
+
+df_essen$PMFM_round_max <- round(df_essen$PMFM_max)
+
+df_essen <- df_essen %>%
+  left_join(shape %>% select(encoded, shape), by = c("stem" = "encoded"))
+
+df_essen_lc <- df_essen %>% filter(str_starts(stem, "LC"))
+df_essen_hc <- df_essen %>% filter(str_starts(stem, "HC"))
+
+df_essen_linear <- df_essen %>% filter(shape == "linear")
+df_essen_arch   <- df_essen %>% filter(shape == "arch")
+df_essen_u      <- df_essen %>% filter(shape == "u")
+```
+
+```{r}
+cat("Full data (Essen)\n")
+print_corr_info(df_essen$Human_MIDI, df_essen$PMFM_max, "Human vs PMFM (max)")
+print_corr_info(df_essen$Human_cents, df_essen$TemperleyEssen_key_avg, "Human vs Temperley Essen (avg)")
+print_corr_info(df_essen$Human_cents, df_essen$IDyOMEssen_avg, "Human vs IDyOM Essen (avg)")
+
+cat("AC data (Essen)\n")
+print_corr_info(df_essen_hc$Human_MIDI, df_essen_hc$PMFM_max, "Human vs PMFM (max)")
+print_corr_info(df_essen_hc$Human_MIDI, df_essen_hc$TemperleyEssen_key_max, "Human vs Temperley Essen (max)")
+print_corr_info(df_essen_hc$Human_MIDI, df_essen_hc$IDyOMEssen_max, "Human vs IDyOM Essen (max)")
+
+cat("NC data (Essen)\n")
+print_corr_info(df_essen_lc$Human_MIDI, df_essen_lc$PMFM_max, "Human vs PMFM (max)")
+print_corr_info(df_essen_lc$Human_MIDI, df_essen_lc$TemperleyEssen_key_max, "Human vs Temperley Essen (max)")
+print_corr_info(df_essen_lc$Human_MIDI, df_essen_lc$IDyOMEssen_max, "Human vs IDyOM Essen (max)")
+```
+
+## Relative importance analyses (Essen)
+```{r}
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "FULL MODEL COMPARISON ANALYSIS (ESSEN)"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+analyze_model_combo(df_essen,
+                    c("PMFM_round_max"),
+                    c("PMFM"),
+                    "PMFM ONLY")
+
+analyze_model_combo(df_essen,
+                    c("TemperleyEssen_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY (ESSEN)")
+
+analyze_model_combo(df_essen,
+                    c("IDyOMEssen_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY (ESSEN)")
+
+analyze_model_combo(df_essen,
+                    c("PMFM_round_max", "TemperleyEssen_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY (ESSEN)")
+
+analyze_model_combo(df_essen,
+                    c("PMFM_round_max", "IDyOMEssen_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen,
+                    c("TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen,
+                    c("PMFM_round_max", "TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS, ESSEN)")
+```
+
+### AC Stems (Essen)
+```{r}
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "AC STEMS MODEL COMPARISON ANALYSIS (ESSEN)"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+analyze_model_combo(df_essen_hc,
+                    c("TemperleyEssen_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_hc,
+                    c("IDyOMEssen_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_hc,
+                    c("PMFM_round_max", "TemperleyEssen_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY (ESSEN)")
+
+analyze_model_combo(df_essen_hc,
+                    c("PMFM_round_max", "IDyOMEssen_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_hc,
+                    c("TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_hc,
+                    c("PMFM_round_max", "TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS, ESSEN)")
+```
+
+### NC Stems (Essen)
+```{r}
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "NC STEMS MODEL COMPARISON ANALYSIS (ESSEN)"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+analyze_model_combo(df_essen_lc,
+                    c("TemperleyEssen_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_lc,
+                    c("IDyOMEssen_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_lc,
+                    c("PMFM_round_max", "TemperleyEssen_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY (ESSEN)")
+
+analyze_model_combo(df_essen_lc,
+                    c("PMFM_round_max", "IDyOMEssen_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_lc,
+                    c("TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_lc,
+                    c("PMFM_round_max", "TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS, ESSEN)")
+```
+
+### Shape (Essen)
+```{r}
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "LINEAR MODEL COMPARISON ANALYSIS (ESSEN)"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+analyze_model_combo(df_essen_linear,
+                    c("TemperleyEssen_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_linear,
+                    c("IDyOMEssen_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_linear,
+                    c("PMFM_round_max", "TemperleyEssen_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY (ESSEN)")
+
+analyze_model_combo(df_essen_linear,
+                    c("PMFM_round_max", "IDyOMEssen_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_linear,
+                    c("TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_linear,
+                    c("PMFM_round_max", "TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS, ESSEN)")
+
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "ARCH MODEL COMPARISON ANALYSIS (ESSEN)"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+analyze_model_combo(df_essen_arch,
+                    c("TemperleyEssen_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_arch,
+                    c("IDyOMEssen_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_arch,
+                    c("PMFM_round_max", "TemperleyEssen_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY (ESSEN)")
+
+analyze_model_combo(df_essen_arch,
+                    c("PMFM_round_max", "IDyOMEssen_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_arch,
+                    c("TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_arch,
+                    c("PMFM_round_max", "TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS, ESSEN)")
+
+cat("\n\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+cat("###", sprintf("%-60s", "U MODEL COMPARISON ANALYSIS (ESSEN)"), "###\n")
+cat(paste(rep("#", 70), collapse = ""), "\n")
+
+analyze_model_combo(df_essen_u,
+                    c("TemperleyEssen_key_max"),
+                    c("Temperley"),
+                    "TEMPERLEY ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_u,
+                    c("IDyOMEssen_max"),
+                    c("IDyOM"),
+                    "IDYOM ONLY (ESSEN)")
+
+analyze_model_combo(df_essen_u,
+                    c("PMFM_round_max", "TemperleyEssen_key_max"),
+                    c("PMFM", "Temperley"),
+                    "PMFM + TEMPERLEY (ESSEN)")
+
+analyze_model_combo(df_essen_u,
+                    c("PMFM_round_max", "IDyOMEssen_max"),
+                    c("PMFM", "IDyOM"),
+                    "PMFM + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_u,
+                    c("TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("Temperley", "IDyOM"),
+                    "TEMPERLEY + IDYOM (ESSEN)")
+
+analyze_model_combo(df_essen_u,
+                    c("PMFM_round_max", "TemperleyEssen_key_max", "IDyOMEssen_max"),
+                    c("PMFM", "Temperley", "IDyOM"),
+                    "FULL (ALL THREE MODELS, ESSEN)")
+```
+
+```{r}
+# Paired bootstrap R^2 (Essen), mirroring the HP paired-bootstrap block above
+subsets_essen <- list(
+  Full   = df_essen,
+  AC     = df_essen_hc,
+  NC     = df_essen_lc,
+  Linear = df_essen_linear,
+  Arch   = df_essen_arch,
+  U      = df_essen_u
+)
+predictor_sets_essen <- list(
+  PMFM      = "PMFM_round_max",
+  Temperley = "TemperleyEssen_key_max",
+  IDyOM     = "IDyOMEssen_max"
+)
+
+boot_matrices_essen <- lapply(names(subsets_essen), function(subset_name) {
+  cat(sprintf("Running: %s\n", subset_name))
+  mat <- bootstrap_r2_paired(all_responses, subsets_essen[[subset_name]], predictor_sets_essen,
+                              n_boot = 1000, n_samp = 25)
+  list(subset = subset_name, mat = mat)
+})
+names(boot_matrices_essen) <- names(subsets_essen)
+
+results_r2_essen <- lapply(names(subsets_essen), function(subset_name) {
+  mat <- boot_matrices_essen[[subset_name]]$mat
+  lapply(names(predictor_sets_essen), function(model_name) {
+    vals <- mat[, model_name]
+    data.frame(
+      subset = subset_name,
+      model  = model_name,
+      mean   = mean(vals),
+      lo     = quantile(vals, 0.025),
+      hi     = quantile(vals, 0.975)
+    )
+  }) %>% bind_rows()
+}) %>% bind_rows()
+results_r2_essen$subset <- factor(results_r2_essen$subset, levels = names(subsets_essen))
+results_r2_essen$model  <- factor(results_r2_essen$model,  levels = names(predictor_sets_essen))
+
+get_dist_essen <- function(subset_name, model_name) {
+  boot_matrices_essen[[subset_name]]$mat[, model_name]
+}
+
+make_annot_essen <- function(subset_names, x_lookup) {
+  rows <- list()
+  for (sn in subset_names) {
+    x_center <- x_lookup[[sn]]
+    max_mean <- max(results_r2_essen$hi[results_r2_essen$subset == sn])
+    for (k in seq_along(model_pairs)) {
+      m1 <- model_pairs[[k]][1]; m2 <- model_pairs[[k]][2]
+      p  <- boot_pval_paired(get_dist_essen(sn, m1), get_dist_essen(sn, m2))
+      s  <- stars(p)
+      if (!is.na(s)) {
+        rows[[length(rows)+1]] <- data.frame(
+          x     = x_center + model_offset[[m1]],
+          xend  = x_center + model_offset[[m2]],
+          y     = max_mean + y_steps[k],
+          label = s
+        )
+      }
+    }
+  }
+  bind_rows(rows)
+}
+
+shape_x_essen <- list(Linear = 1, Arch = 2, U = 3)
+
+cadence_annot_essen <- make_annot_essen(c("AC", "NC"), cadence_x)
+shape_annot_essen   <- make_annot_essen(c("Linear", "Arch", "U"), shape_x_essen)
+
+cadence_plot_essen <- add_brackets(
+  ggplot(results_r2_essen %>% filter(subset %in% c("AC", "NC")),
+         aes(x = subset, y = mean, fill = model)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+    geom_errorbar(aes(ymin = lo, ymax = hi),
+                  position = position_dodge(width = 0.8), width = 0.0) +
+    scale_fill_manual(values = c("PMFM" = "#1f77b4", "Temperley" = "#ff7f0e", "IDyOM" = "#2ca02c")) +
+    labs(x = "Subset", y = expression(R^2), fill = "Model",
+         title = "Bootstrapped R² by Cadence Type (Essen Corpus)") +
+    theme_bw(base_size = 12) +
+    theme(text = element_text(family = "Arial"),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "top"),
+  cadence_annot_essen
+)
+
+shape_plot_essen <- add_brackets(
+  ggplot(results_r2_essen %>% filter(subset %in% c("Linear", "Arch", "U")),
+         aes(x = subset, y = mean, fill = model)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+    geom_errorbar(aes(ymin = lo, ymax = hi),
+                  position = position_dodge(width = 0.8), width = 0.0) +
+    scale_fill_manual(values = c("PMFM" = "#1f77b4", "Temperley" = "#ff7f0e", "IDyOM" = "#2ca02c")) +
+    labs(x = "Subset", y = expression(R^2), fill = "Model",
+         title = "Bootstrapped R² by Melodic Shape (Essen Corpus)") +
+    theme_bw(base_size = 12) +
+    theme(text = element_text(family = "Arial"),
+          plot.title = element_text(hjust = 0.5),
+          legend.position = "top"),
+  shape_annot_essen
+)
+
+ggsave("exports/r2_bootstrap_cadence_essen.png", cadence_plot_essen, width = 6, height = 6, dpi = 300)
+ggsave("exports/r2_bootstrap_shapes_essen.png",  shape_plot_essen,  width = 8, height = 6, dpi = 300)
+```
+
