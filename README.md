@@ -2,6 +2,8 @@
 
 Melodic continuation is modeled as a physical system in which a note is pulled by three "musical forces" adapted from Larson's theory of melodic forces: **gravity**, **magnetism**, and **inertia**. This is implemented as a generative probabilistic program (the **PMFM**, Probabilistic Melodic Forces Model) in [Gen.jl](https://www.gen.dev/), with melodic completions inferred via particle filtering and compared against human melodic-expectation judgments and competing computational models (IDyOM, Temperley).
 
+© American Psychological Association, 2026. This paper is not the copy of record and may not exactly replicate the authoritative document published in the APA journal. The final article is available, upon publication, at: 10.1037/xge0002053
+
 ## Directory structure
 
 ```
